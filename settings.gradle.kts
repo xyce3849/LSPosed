@@ -16,7 +16,8 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "LSPosed"
+rootProject.name = "Vector"
+
 include(
     ":app",
     ":core",
@@ -30,4 +31,5 @@ include(
     ":services:manager-service",
     ":services:daemon-service",
     ":xposed",
+    ":zygisk",
 )
