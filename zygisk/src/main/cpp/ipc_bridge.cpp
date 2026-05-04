@@ -307,23 +307,23 @@ lsplant::ScopedLocalRef<jobject> IPCBridge::RequestSystemServerBinder(
     auto service_name = lsplant::ScopedLocalRef(env, env->NewStringUTF(bridgeServiceName.data()));
     lsplant::ScopedLocalRef<jobject> binder = {env, nullptr};
 
-    // The system_server might start its services slightly after Zygisk injects us.
-    // We retry a few times to give it a chance to register.
-    for (int i = 0; i < 3; ++i) {
+    // The daemon process and system_server specialization run in parallel.
+    // On slower devices, the daemon may take several seconds to call addService.
+    // We poll for up to 10 seconds to ensure the early IPC channel for system_server is available.
+    const int max_retry = 10;
+    for (int i = 0; i < max_retry; ++i) {
         binder = lsplant::JNI_CallStaticObjectMethod(env, service_manager_class_,
                                                      get_service_method_, service_name.get());
         if (binder) {
             LOGI("Got system server binder via {} on attempt {}.", bridgeServiceName.data(), i + 1);
             return binder;
         }
-        if (i < 2) {
-            LOGW("Failed to get system server binder via {}, will retry in 1 second...",
-                 bridgeServiceName.data());
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
+        LOGW("Failed to get system server binder via {}, will retry in 1 second...",
+             bridgeServiceName.data());
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
-    LOGE("Failed to get system server binder after 3 attempts. Aborting.");
+    LOGE("Failed to get system server binder after {} attempts. Aborting.", max_retry);
     return {env, nullptr};
 }
 
@@ -476,8 +476,11 @@ jboolean IPCBridge::ExecTransact_Replace(jboolean *res, JNIEnv *env, jobject obj
         if (*res == JNI_FALSE) {
             uint64_t caller_id = BinderCaller::GetId();
             if (caller_id != 0) {
+                // LOGV("Caller {} rejected by bridge service.", caller_id);
                 g_last_failed_id.store(caller_id, std::memory_order_relaxed);
             }
+        } else {
+            g_last_failed_id.store(~0, std::memory_order_relaxed);
         }
         return true;  // Return true to indicate we handled the call.
     }
@@ -486,23 +489,17 @@ jboolean IPCBridge::ExecTransact_Replace(jboolean *res, JNIEnv *env, jobject obj
 
 jboolean JNICALL IPCBridge::CallBooleanMethodV_Hook(JNIEnv *env, jobject obj, jmethodID methodId,
                                                     va_list args) {
-    uint64_t current_caller_id = BinderCaller::GetId();
-    if (current_caller_id != 0) {
-        uint64_t last_failed = g_last_failed_id.load(std::memory_order_relaxed);
-        // If this caller is the one that just failed,
-        // skip interception and go straight to the original function.
-        if (current_caller_id == last_failed) {
-            // We "consume" the failed state by resetting it, so the *next* call is not skipped.
-            g_last_failed_id.store(~0, std::memory_order_relaxed);
-            return GetInstance().call_boolean_method_v_backup_(env, obj, methodId, args);
-        }
-    }
-
     // Check if the method being called is the one we want to intercept: Binder.execTransact()
     if (methodId == GetInstance().exec_transact_backup_method_id_) {
+        uint64_t current_caller_id = BinderCaller::GetId();
+
         jboolean res = false;
         // Attempt to handle the transaction with our replacement logic.
-        if (ExecTransact_Replace(&res, env, obj, args)) {
+        if (current_caller_id != 0 &&
+            // If this caller is the one that just failed,
+            // skip interception and go straight to the original function.
+            current_caller_id != g_last_failed_id.load(std::memory_order_relaxed) &&
+            ExecTransact_Replace(&res, env, obj, args)) {
             return res;  // If we handled it, return the result directly.
         }
         // If not handled, fall through to call the original method.
